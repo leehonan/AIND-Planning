@@ -101,7 +101,6 @@ class PgNode_s(PgNode):
 class PgNode_a(PgNode):
     """A-type (action) Planning Graph node - inherited from PgNode """
 
-
     def __init__(self, action: Action):
         """A-level Planning Graph node constructor
 
@@ -307,6 +306,28 @@ class PlanningGraph():
         #   to see if a proposed PgNode_a has prenodes that are a subset of the previous S level.  Once an
         #   action node is added, it MUST be connected to the S node instances in the appropriate s_level set.
 
+        # For each action, add it to the a-level if it prerequisites are met by nodes in the
+        # preceding s-level.
+        for action in self.all_actions:
+            proposed_a_node = PgNode_a(action)
+
+            # For the a_node, are its prenodes a subset of the prior s-level? Use issubset for
+            # performance/order insensitivity...
+            if proposed_a_node.prenodes.issubset(self.s_levels[level]):
+
+                # add a new a-level (set) to the planning graph on the first match
+                if len(self.a_levels) < (level + 1):
+                    self.a_levels.append(set())
+
+                self.a_levels[level].add(proposed_a_node)
+
+                # Given the new a-node, connect it to preceding s-nodes that match the a-node's
+                # prerequisites.
+                for s_node in [s_node for s_node in self.s_levels[level] if s_node in proposed_a_node.prenodes]:
+                    s_node.children.add(proposed_a_node)
+                    proposed_a_node.parents.add(s_node)
+
+
     def add_literal_level(self, level):
         """ add an S (literal) level to the Planning Graph
 
@@ -324,6 +345,20 @@ class PlanningGraph():
         #   may be "added" to the set without fear of duplication.  However, it is important to then correctly create and connect
         #   all of the new S nodes as children of all the A nodes that could produce them, and likewise add the A nodes to the
         #   parent sets of the S nodes
+
+        # For each literal, add it to the s-level if it prerequisites are met by the effects of
+        # nodes in the preceding a-level.
+        for action_node in self.a_levels[level - 1]:
+            for literal_node in action_node.effnodes:
+                # add a new s-level (set) to the planning graph on the first match
+                if len(self.s_levels) < (level + 1):
+                    self.s_levels.append(set())
+                # add literal node to new s-level
+                self.s_levels[level].add(literal_node)
+                # add each prior action node with a matching prereq effect as a parent
+                literal_node.parents.add(action_node)
+                action_node.children.add(literal_node)
+
 
     def update_a_mutex(self, nodeset):
         """ Determine and update sibling mutual exclusion for A-level nodes
@@ -382,7 +417,14 @@ class PlanningGraph():
         :return: bool
         """
         # TODO test for Inconsistent Effects between nodes
-        return False
+
+        # Test for mutually-exclusive effects between the two action node's 'add' or 'rem' lists
+        if (len(set(node_a1.action.effect_add).intersection(node_a2.action.effect_rem)) > 0) or \
+                (len(set(node_a1.action.effect_rem).intersection(node_a2.action.effect_add)) > 0):
+            return True
+        else:
+            return False
+
 
     def interference_mutex(self, node_a1: PgNode_a, node_a2: PgNode_a) -> bool:
         """
@@ -399,7 +441,18 @@ class PlanningGraph():
         :return: bool
         """
         # TODO test for Interference between nodes
-        return False
+
+        # Test for mutually-exclusion between the two action node's effects and preconditions (
+        # i.e. where if one action precedes the other, its effect(s) will preclude the successor
+        # according to the successor's preconditions)
+        if (len(set(node_a1.action.effect_add).intersection(node_a2.action.precond_neg)) > 0) or \
+                (len(set(node_a1.action.effect_rem).intersection(node_a2.action.precond_pos)) > 0) or \
+                (len(set(node_a2.action.effect_add).intersection(node_a1.action.precond_neg)) > 0) or \
+                (len(set(node_a2.action.effect_rem).intersection(node_a1.action.precond_pos)) > 0):
+            return True
+        else:
+            return False
+
 
     def competing_needs_mutex(self, node_a1: PgNode_a, node_a2: PgNode_a) -> bool:
         """
@@ -412,8 +465,17 @@ class PlanningGraph():
         :return: bool
         """
 
-        # TODO test for Competing Needs between nodes
+        # Test each action's parents for a mutex with the other action's parents.  Mutex
+        # operation is commutative, bi-directional.
+        for a1_parent in node_a1.parents:
+            for a2_parent in node_a2.parents:
+                if a1_parent.is_mutex(a2_parent):
+                    # conflict
+                    return True
+
+        # no conflict
         return False
+
 
     def update_s_mutex(self, nodeset: set):
         """ Determine and update sibling mutual exclusion for S-level nodes
@@ -448,7 +510,10 @@ class PlanningGraph():
         :return: bool
         """
         # TODO test for negation between nodes
-        return False
+
+        # Test for matching literals (symbols) where one is true and the other false
+        return node_s1.symbol == node_s2.symbol and node_s1.is_pos != node_s2.is_pos
+
 
     def inconsistent_support_mutex(self, node_s1: PgNode_s, node_s2: PgNode_s):
         """
@@ -467,14 +532,43 @@ class PlanningGraph():
         :return: bool
         """
         # TODO test for Inconsistent Support between nodes
-        return False
+
+        # Test each literal's parent actions for a mutex with the other literal's parent actions.
+        # Mutex operation is commutative, bi-directional.
+        for s1_parent in node_s1.parents:
+            for s2_parent in node_s2.parents:
+                if not s1_parent.is_mutex(s2_parent):
+                    # non conflicting pair - we only need one non-mutually-exclusive pair
+                    return False
+
+        # all pairs conflict
+        return True
+
 
     def h_levelsum(self) -> int:
         """The sum of the level costs of the individual goals (admissible if goals independent)
 
         :return: int
         """
-        level_sum = 0
         # TODO implement
+
         # for each goal in the problem, determine the level cost, then add them together
+
+        # get list of goals as s-nodes - copy so we can remove elements as they're found
+        goals = [PgNode_s(goal, True) for goal in self.problem.goal]
+
+        level_sum = 0
+
+        # iterate through each s-level node, removing each goal as we find it and incrementing
+        # the level_sum - ensuring each node is visited once and once only
+        for level, state_nodes in enumerate(self.s_levels, 0):
+            if len(goals) == 0:
+                # break out of loop if no goals left
+                break
+            for state_node in [state_node for state_node in state_nodes if state_node in goals]:
+                # found a state node that achieves a goal
+                goals.remove(state_node)
+                level_sum += level
+                break
+
         return level_sum
